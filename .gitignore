@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Compiled Swift panel — built into ~/.claude-beacon by install.sh, never the repo.
+# Ignore any binary left behind if you compile locally for testing.
+/hook/beacon-panel
+*.dSYM/
+.build/
+*.o
+*.swiftmodule
+
+# Editors
+.idea/
+*.swp

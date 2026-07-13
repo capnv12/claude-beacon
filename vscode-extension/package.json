@@ -1,0 +1,22 @@
+{
+  "name": "claude-beacon",
+  "displayName": "Claude Beacon",
+  "description": "Companion for Claude Beacon notifications: focuses the exact integrated terminal for a session and reports which terminal is focused (matched by tty).",
+  "version": "1.0.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeBeacon.focusTerminal",
+        "title": "Claude Beacon: Focus Session Terminal"
+      }
+    ]
+  }
+}

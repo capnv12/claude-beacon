@@ -1,0 +1,51 @@
+{
+  "_comment": "Claude Beacon configuration. Edit and save; changes apply to the next notification (no rebuild needed).",
+
+  "timeouts": {
+    "_comment": "Seconds before a notification auto-dismisses when you're away. 0 = never (stays until you focus its terminal or click).",
+    "done": 30,
+    "attention": 0
+  },
+
+  "sound": "Glass",
+  "_sound_comment": "macOS system sound name (Glass, Ping, Hero, Submarine, Pop, Tink, ...). Empty string = silent.",
+
+  "position": "bottom-left",
+  "_position_comment": "bottom-left | bottom-right | top-left | top-right",
+
+  "size": { "width": 420, "height": 120 },
+  "spacing": { "margin": 16, "gap": 12 },
+
+  "cornerRadius": 22,
+  "opacity": 1.0,
+  "_opacity_comment": "0.0 (transparent) .. 1.0 (opaque) overall panel opacity.",
+
+  "material": "liquid-glass",
+  "_material_comment": "liquid-glass (macOS 26+) | vibrancy (frosted) | dark | light",
+
+  "minVisibleSeconds": 2.0,
+  "slideOffset": 40,
+  "animation": { "appear": 0.28, "dismiss": 0.24, "reflow": 0.25 },
+
+  "accent": {
+    "_comment": "Hex color of the left accent stripe per kind.",
+    "done": "#34C759",
+    "attention": "#FF9F0A"
+  },
+
+  "title": { "fontSize": 14, "textColor": "" },
+  "message": { "fontSize": 12, "textColor": "" },
+  "_color_comment": "Every *Color field takes a hex like #FFFFFF. Empty string = system default (adapts to light/dark).",
+
+  "icon": "/Applications/Claude.app/Contents/Resources/electron.icns",
+
+  "buttons": {
+    "_comment": "label = the button text. backgroundColor = the button fill. textColor = the label color. Empty backgroundColor = system accent (focus) / default (dismiss).",
+    "focus": {
+      "label": "Focus Terminal",
+      "backgroundColor": "",
+      "textColor": ""
+    },
+    "dismiss": { "label": "Dismiss", "backgroundColor": "", "textColor": "" }
+  }
+}
