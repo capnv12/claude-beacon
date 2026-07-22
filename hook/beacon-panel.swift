@@ -49,6 +49,9 @@ func cfgDouble(_ keyPath: String, _ fallback: Double) -> Double {
 func cfgString(_ keyPath: String, _ fallback: String) -> String {
     (configValue(keyPath) as? String) ?? fallback
 }
+func cfgBool(_ keyPath: String, _ fallback: Bool) -> Bool {
+    (configValue(keyPath) as? NSNumber)?.boolValue ?? fallback
+}
 extension NSColor {
     convenience init?(hex: String) {
         var s = hex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -95,6 +98,15 @@ let titleColor = cfgColorOptional("title.textColor") ?? .labelColor
 let messageColor = cfgColorOptional("message.textColor") ?? .secondaryLabelColor
 let accentColor = cfgColor("accent.\(kind)", kind == "attention" ? .systemOrange : .systemGreen)
 
+// Stacking: once more than `stackThreshold` panels are alive and none has been
+// acted on for `stackDelay` seconds, they collapse into a single click-to-open
+// pile. A brand-new panel peeks on its own for `peekSeconds` before joining.
+let stackingEnabled = cfgBool("stacking.enabled", true)
+let stackThreshold = Int(cfgDouble("stacking.threshold", 3))
+let stackDelay = cfgDouble("stacking.delaySeconds", 20)
+let peekSeconds = cfgDouble("stacking.peekSeconds", 2.0)
+let cascadeOffset = cfgDouble("stacking.cascadeOffset", 8)
+
 let isRight = position.contains("right")
 let isTop = position.contains("top")
 
@@ -127,7 +139,8 @@ let mySlotPath = "\(slotsDirectory)/slot-\(myPid)"
 let myStart = Date().timeIntervalSince1970
 try? "\(myStart)".write(toFile: mySlotPath, atomically: true, encoding: .utf8)
 func releaseSlot() { try? FileManager.default.removeItem(atPath: mySlotPath) }
-func currentRank() -> Int {
+// Every alive panel, oldest first (ties broken by pid), pruning dead slots.
+func aliveSlots() -> [(pid: Int32, start: Double)] {
     let files = (try? FileManager.default.contentsOfDirectory(atPath: slotsDirectory)) ?? []
     var alive: [(pid: Int32, start: Double)] = []
     for file in files where file.hasPrefix("slot-") {
@@ -141,7 +154,66 @@ func currentRank() -> Int {
         alive.append((pid, start))
     }
     alive.sort { $0.start != $1.start ? $0.start < $1.start : $0.pid < $1.pid }
-    return alive.firstIndex { $0.pid == myPid } ?? 0
+    return alive
+}
+func currentRank() -> Int { aliveSlots().firstIndex { $0.pid == myPid } ?? 0 }
+
+// MARK: - Shared "last user action" (drives collapse / re-collapse timing)
+
+// A unix timestamp written whenever the user clicks Focus / Dismiss / expand on
+// ANY panel. Automatic dismissal (timeout, terminal-focus) never writes it, so
+// an unattended pile still collapses on schedule.
+let lastActionPath = NSString(string: "~/.claude-beacon/state/last-action").expandingTildeInPath
+func recordUserAction() {
+    try? "\(Date().timeIntervalSince1970)".write(toFile: lastActionPath, atomically: true, encoding: .utf8)
+}
+func lastActionTime() -> Double? {
+    (try? String(contentsOfFile: lastActionPath, encoding: .utf8))
+        .flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+}
+
+// "Dismiss all" from a collapsed stack: one panel writes a timestamp and every
+// panel alive at that moment (start <= signal) self-dismisses on its next tick.
+// Panels spawned afterwards (start > signal) ignore it, so a later burst is safe.
+let dismissAllPath = NSString(string: "~/.claude-beacon/state/dismiss-all").expandingTildeInPath
+func signalDismissAll() {
+    try? "\(Date().timeIntervalSince1970)".write(toFile: dismissAllPath, atomically: true, encoding: .utf8)
+}
+func shouldDismissAll() -> Bool {
+    guard let s = try? String(contentsOfFile: dismissAllPath, encoding: .utf8),
+          let t = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+    return t >= myStart
+}
+
+// MARK: - Per-tick layout (normal tile vs collapsed stack vs peek)
+
+typealias Layout = (origin: NSPoint, alpha: CGFloat, front: Bool, back: Bool,
+                    collapsed: Bool, isFront: Bool, count: Int)
+func desiredLayout() -> Layout {
+    let alive = aliveSlots()
+    let count = alive.count
+    let rank = alive.firstIndex { $0.pid == myPid } ?? 0
+    let full = CGFloat(panelOpacity)
+    // Not stacking, or too few panels: normal tiled layout.
+    guard stackingEnabled, count > stackThreshold else {
+        return (targetOrigin(forRank: rank), full, false, false, false, false, count)
+    }
+    let now = Date().timeIntervalSince1970
+    let reference = lastActionTime() ?? (alive.first?.start ?? myStart)
+    guard (now - reference) >= stackDelay else {
+        return (targetOrigin(forRank: rank), full, false, false, false, false, count)
+    }
+    // Newest panel peeks on its own before joining the collapsed stack.
+    if alive.last?.pid == myPid, (now - myStart) < peekSeconds {
+        return (targetOrigin(forRank: 1), full, true, false, false, false, count)
+    }
+    // Collapsed: front card (rank 0) on top; deeper cards cascade behind + fade.
+    let depth = rank
+    let base = targetOrigin(forRank: 0)
+    let dy = CGFloat(min(depth, 3)) * cascadeOffset
+    let origin = NSPoint(x: base.x, y: base.y + (isTop ? -dy : dy))
+    let alpha: CGFloat = depth == 0 ? full : depth == 1 ? 0.55 : depth == 2 ? 0.3 : 0.0
+    return (origin, alpha, depth == 0, depth != 0, true, depth == 0, count)
 }
 
 // MARK: - App + panel
@@ -153,7 +225,10 @@ final class NonKeyPanel: NSPanel {
 let application = NSApplication.shared
 application.setActivationPolicy(.prohibited)
 
-var settledOrigin = targetOrigin(forRank: currentRank())
+var settledOrigin = desiredLayout().origin
+var settledAlpha = CGFloat(panelOpacity)
+var orderedFront = false
+var orderedBack = false
 let panelFrame = NSRect(origin: settledOrigin, size: NSSize(width: width, height: height))
 let panel = NonKeyPanel(contentRect: panelFrame,
                         styleMask: [.borderless, .nonactivatingPanel],
@@ -204,8 +279,18 @@ final class PanelController: NSObject {
     var result = "dismiss"
     var closing = false
     var target: NSPanel?
-    @objc func focus() { result = "focus"; finish() }
-    @objc func dismiss() { result = "dismiss"; finish() }
+    // A user click records an action (resetting the shared collapse idle timer);
+    // automatic paths (timeout, terminal-focus) dismiss without recording, so an
+    // unattended pile still collapses on schedule.
+    @objc func focusClicked() { recordUserAction(); result = "focus"; finish() }
+    @objc func dismissClicked() { recordUserAction(); result = "dismiss"; finish() }
+    // Clicking a collapsed stack only records the action; the reflow tick then
+    // sees a fresh last-action and fans the panels back out (no dismissal).
+    @objc func expandClicked() { recordUserAction() }
+    // "Dismiss all" on the collapsed stack: signal every alive panel to close,
+    // then close this one. This panel's own result stays "dismiss" (no focus).
+    @objc func dismissAllClicked() { recordUserAction(); signalDismissAll(); autoDismiss() }
+    func autoDismiss() { result = "dismiss"; finish() }
     func finish() {
         if closing { return }
         closing = true
@@ -241,10 +326,56 @@ let focusWidth: CGFloat = 132
 let dismissWidth: CGFloat = 88
 let focusX = width - padding - focusWidth
 let dismissX = focusX - 8 - dismissWidth
-content.addSubview(makeButton(focusLabel, action: #selector(PanelController.focus),
-                              x: focusX, w: focusWidth, background: focusButtonColor, textColor: focusTextColor))
-content.addSubview(makeButton(dismissLabel, action: #selector(PanelController.dismiss),
-                              x: dismissX, w: dismissWidth, background: dismissButtonColor, textColor: dismissTextColor))
+let focusButton = makeButton(focusLabel, action: #selector(PanelController.focusClicked),
+                             x: focusX, w: focusWidth, background: focusButtonColor, textColor: focusTextColor)
+let dismissButton = makeButton(dismissLabel, action: #selector(PanelController.dismissClicked),
+                               x: dismissX, w: dismissWidth, background: dismissButtonColor, textColor: dismissTextColor)
+content.addSubview(focusButton)
+content.addSubview(dismissButton)
+
+// MARK: - Collapsed-stack chrome (hidden unless this is the front of a pile)
+
+// Bottom row of a collapsed front card: a "Dismiss all" button at the right, a
+// count badge to its left, and a hint. The transparent full-card overlay under
+// them turns any other click into "expand"; the Dismiss-all button sits ABOVE it
+// so it keeps its own click.
+let dismissAllWidth: CGFloat = 112
+let dismissAllX = width - padding - dismissAllWidth
+let badgeSize: CGFloat = 30
+let badgeX = dismissAllX - 8 - badgeSize
+let badge = NSView(frame: NSRect(x: badgeX, y: 13, width: badgeSize, height: badgeSize))
+badge.wantsLayer = true
+badge.layer?.backgroundColor = accentColor.cgColor
+badge.layer?.cornerRadius = badgeSize / 2
+let badgeLabel = NSTextField(labelWithString: "")
+badgeLabel.font = NSFont.boldSystemFont(ofSize: 13)
+badgeLabel.textColor = .white
+badgeLabel.alignment = .center
+badgeLabel.frame = NSRect(x: 0, y: (badgeSize - 17) / 2, width: badgeSize, height: 17)
+badge.addSubview(badgeLabel)
+badge.isHidden = true
+content.addSubview(badge)
+
+let expandHint = NSTextField(labelWithString: "Click to expand")
+expandHint.font = NSFont.systemFont(ofSize: 11)
+expandHint.textColor = .secondaryLabelColor
+expandHint.frame = NSRect(x: textLeft, y: 16, width: max(0, badgeX - 8 - textLeft), height: 16)
+expandHint.isHidden = true
+content.addSubview(expandHint)
+
+let expandOverlay = NSButton(title: "", target: controller, action: #selector(PanelController.expandClicked))
+expandOverlay.isBordered = false
+expandOverlay.isTransparent = true
+expandOverlay.frame = NSRect(origin: .zero, size: panelFrame.size)
+expandOverlay.isHidden = true
+content.addSubview(expandOverlay)
+
+// Added last -> above the overlay, so its clicks dismiss the whole stack.
+let dismissAllButton = makeButton("Dismiss all", action: #selector(PanelController.dismissAllClicked),
+                                  x: dismissAllX, w: dismissAllWidth,
+                                  background: dismissButtonColor, textColor: dismissTextColor)
+dismissAllButton.isHidden = true
+content.addSubview(dismissAllButton)
 
 // MARK: - Card material
 
@@ -279,18 +410,56 @@ default:
 
 // MARK: - Per-terminal focus detection
 
-func runOsascript(_ script: String) -> String? {
+func runProcess(_ path: String, _ args: [String]) -> String? {
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    process.arguments = ["-e", script]
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = args
     let pipe = Pipe()
     process.standardOutput = pipe
     process.standardError = FileHandle.nullDevice
     guard (try? process.run()) != nil else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
-    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     return (out?.isEmpty == false) ? out : nil
+}
+func runOsascript(_ script: String) -> String? { runProcess("/usr/bin/osascript", ["-e", script]) }
+
+// Locate the `wezterm` CLI. WezTerm exports WEZTERM_EXECUTABLE_DIR (the .app's
+// MacOS dir, which also holds `wezterm`); fall back to the common install paths.
+func weztermBinary() -> String? {
+    var candidates: [String] = []
+    if let dir = ProcessInfo.processInfo.environment["WEZTERM_EXECUTABLE_DIR"] {
+        candidates.append("\(dir)/wezterm")
+    }
+    candidates += ["/opt/homebrew/bin/wezterm", "/usr/local/bin/wezterm",
+                   "/Applications/WezTerm.app/Contents/MacOS/wezterm"]
+    return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+}
+// The tty of the WezTerm pane that currently has GUI focus, or nil. list-clients
+// reports the focused pane id per client (pick the least-idle client); list maps
+// that pane id to its tty. Requires the inherited WEZTERM_UNIX_SOCKET to reach
+// the originating mux, so it targets the right WezTerm instance.
+func weztermFocusedTty() -> String? {
+    guard let wezterm = weztermBinary(),
+          let clientsJSON = runProcess(wezterm, ["cli", "list-clients", "--format", "json"]),
+          let clients = (try? JSONSerialization.jsonObject(with: Data(clientsJSON.utf8))) as? [[String: Any]],
+          !clients.isEmpty
+    else { return nil }
+    func idle(_ c: [String: Any]) -> Double {
+        guard let it = c["idle_time"] as? [String: Any] else { return .greatestFiniteMagnitude }
+        let secs = (it["secs"] as? NSNumber)?.doubleValue ?? 0
+        let nanos = (it["nanos"] as? NSNumber)?.doubleValue ?? 0
+        return secs + nanos / 1e9
+    }
+    guard let paneId = clients.min(by: { idle($0) < idle($1) })?["focused_pane_id"] as? Int,
+          let panesJSON = runProcess(wezterm, ["cli", "list", "--format", "json"]),
+          let panes = (try? JSONSerialization.jsonObject(with: Data(panesJSON.utf8))) as? [[String: Any]]
+    else { return nil }
+    for pane in panes where (pane["pane_id"] as? Int) == paneId {
+        if let tty = pane["tty_name"] as? String, !tty.isEmpty { return tty }
+    }
+    return nil
 }
 func focusedTerminalTty() -> String? {
     guard !targetTerminalBundle.isEmpty,
@@ -315,6 +484,8 @@ func focusedTerminalTty() -> String? {
             }
         }
         return nil
+    case "com.github.wez.wezterm":
+        return weztermFocusedTty()
     default:
         // No per-tab focus API (Warp, Ghostty, ...): never auto-dismiss on focus.
         return nil
@@ -325,21 +496,58 @@ let focusCheckStart = Date()
 let focusTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
     if controller.closing || targetTty.isEmpty { return }
     guard Date().timeIntervalSince(focusCheckStart) >= minVisibleSeconds else { return }
-    if focusedTerminalTty() == targetTty { controller.dismiss() }
+    if focusedTerminalTty() == targetTty { controller.autoDismiss() }
 }
 RunLoop.main.add(focusTimer, forMode: .common)
 
-// MARK: - Reflow (slide to new rank when a lower panel closes)
+// MARK: - Reflow (tile by rank, collapse into a stack, and peek/fan animations)
+
+// Show buttons vs the collapsed-stack badge/hint/click-target for this tick.
+func applyChrome(_ layout: Layout) {
+    let showButtons = !layout.collapsed
+    focusButton.isHidden = !showButtons
+    dismissButton.isHidden = !showButtons
+    let showBadge = layout.collapsed && layout.isFront
+    badge.isHidden = !showBadge
+    expandHint.isHidden = !showBadge
+    expandOverlay.isHidden = !showBadge
+    dismissAllButton.isHidden = !showBadge
+    if showBadge { badgeLabel.stringValue = "\(layout.count)" }
+}
+// Keep the front card above its stack and deeper cards behind it. Latches so the
+// order is nudged only on transitions, not every tick.
+func applyOrder(_ layout: Layout) {
+    if layout.front {
+        if !orderedFront { panel.orderFrontRegardless(); orderedFront = true }
+        orderedBack = false
+    } else if layout.back {
+        if !orderedBack { panel.order(.below, relativeTo: 0); orderedBack = true }
+        orderedFront = false
+    } else {
+        orderedFront = false; orderedBack = false
+    }
+}
 
 let reflowTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     if controller.closing { return }
-    let origin = targetOrigin(forRank: currentRank())
-    if abs(origin.x - settledOrigin.x) > 0.5 || abs(origin.y - settledOrigin.y) > 0.5 {
-        settledOrigin = origin
+    // A "Dismiss all" on any panel clears every panel alive at that moment.
+    if shouldDismissAll() { controller.autoDismiss(); return }
+    let layout = desiredLayout()
+    applyChrome(layout)
+    applyOrder(layout)
+    // Faded cards behind the front of a collapsed stack must not swallow clicks
+    // meant for the front card.
+    panel.ignoresMouseEvents = layout.back
+    let originChanged = abs(layout.origin.x - settledOrigin.x) > 0.5 || abs(layout.origin.y - settledOrigin.y) > 0.5
+    let alphaChanged = abs(layout.alpha - settledAlpha) > 0.001
+    if originChanged || alphaChanged {
+        settledOrigin = layout.origin
+        settledAlpha = layout.alpha
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = reflowDuration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            panel.animator().setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true)
+            panel.animator().setFrame(NSRect(origin: layout.origin, size: NSSize(width: width, height: height)), display: true)
+            panel.animator().alphaValue = layout.alpha
         }
     }
 }
@@ -347,18 +555,22 @@ RunLoop.main.add(reflowTimer, forMode: .common)
 
 // MARK: - Appear + timeout
 
+let appearLayout = desiredLayout()
+settledOrigin = appearLayout.origin
+settledAlpha = appearLayout.alpha
+applyChrome(appearLayout)
 panel.alphaValue = 0
 panel.setFrame(NSRect(x: slideOutX(settledOrigin.x), y: settledOrigin.y, width: width, height: height), display: false)
 panel.orderFrontRegardless()
 NSAnimationContext.runAnimationGroup { ctx in
     ctx.duration = appearDuration
     ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-    panel.animator().alphaValue = panelOpacity
+    panel.animator().alphaValue = appearLayout.alpha
     panel.animator().setFrame(NSRect(origin: settledOrigin, size: NSSize(width: width, height: height)), display: true)
 }
 
 if timeoutSeconds > 0 {
-    DispatchQueue.main.asyncAfter(deadline: .now() + timeoutSeconds) { controller.dismiss() }
+    DispatchQueue.main.asyncAfter(deadline: .now() + timeoutSeconds) { controller.autoDismiss() }
 }
 
 application.run()

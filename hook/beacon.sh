@@ -38,6 +38,29 @@ transcript_path="$(printf '%s' "$payload" | /usr/bin/jq -r '.transcript_path // 
 session_cwd="$(printf '%s' "$payload" | /usr/bin/jq -r '.cwd // empty')"
 hook_event="$(printf '%s' "$payload" | /usr/bin/jq -r '.hook_event_name // empty')"
 notification_message="$(printf '%s' "$payload" | /usr/bin/jq -r '.message // empty')"
+# Notification events carry a `.notification_type` (permission_prompt,
+# idle_prompt, agent lifecycle, ...); Stop events do not. Older/newer builds may
+# name it `.type`, so accept either. Confirmed field name via captured payloads.
+notification_type="$(printf '%s' "$payload" | /usr/bin/jq -r '.notification_type // .type // empty')"
+
+# Optional raw-payload capture for discovering which Notification `.type` values
+# your setup emits (set notifications.debugLog to true in config.json). Off by
+# default; the file grows unbounded while on, so turn it back off when done.
+if [[ "$(/usr/bin/jq -r '.notifications.debugLog // false' "$CONFIG" 2>/dev/null)" == "true" ]]; then
+    printf '%s\t%s\n' "$(/bin/date +%s)" "$payload" >> "$BEACON_HOME/state/debug-payloads.log" 2>/dev/null || true
+fi
+
+# Subagent lifecycle emits a Notification per subagent action (e.g. a subagent
+# finishing -> `agent_completed`), which would otherwise raise a panel each time.
+# Suppress any Notification whose `.type` is listed in notifications.suppressTypes
+# (default: agent_completed). Unknown/real types still show; Stop is unaffected.
+if [[ "$hook_event" == "Notification" && -n "$notification_type" ]]; then
+    if /usr/bin/jq -e --arg t "$notification_type" \
+        '((.notifications.suppressTypes) // ["agent_completed"]) | index($t) != null' \
+        "$CONFIG" >/dev/null 2>&1; then
+        exit 0
+    fi
+fi
 
 # Controlling tty of the Claude process that spawned this hook (e.g. /dev/ttys009).
 session_tty="/dev/$(ps -o tty= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"

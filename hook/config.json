@@ -7,6 +7,21 @@
     "attention": 0
   },
 
+  "notifications": {
+    "_comment": "Notification-event handling. suppressTypes lists Notification .type values that should NOT raise a panel - subagent lifecycle (e.g. a subagent finishing) fires one per action and floods otherwise. Real prompts (permission_prompt, idle_prompt, ...) and unknown types still show. Flip debugLog to true to append every raw hook payload to state/debug-payloads.log so you can see the exact .type values your setup emits and tune this list.",
+    "suppressTypes": ["agent_completed"],
+    "debugLog": false
+  },
+
+  "stacking": {
+    "_comment": "When more than `threshold` panels are alive and none has been acted on for `delaySeconds`, they collapse into a single macOS-style stack you click to fan open (it re-collapses after another idle period). A brand-new panel peeks on its own for `peekSeconds` before joining.",
+    "enabled": true,
+    "threshold": 3,
+    "delaySeconds": 20,
+    "peekSeconds": 2.0,
+    "cascadeOffset": 8
+  },
+
   "sound": "Glass",
   "_sound_comment": "macOS system sound name (Glass, Ping, Hero, Submarine, Pop, Tink, ...). Empty string = silent.",
 

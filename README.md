@@ -23,8 +23,12 @@ of which one needs attention.
 - **Two kinds** — `done` (a turn finished, green stripe) and `attention` (needs
   input or a permission decision, amber stripe).
 - **Non‑intrusive** — the panel never steals keyboard focus; keep typing.
-- **Stacks any number** — panels stack from the corner and wrap into columns;
-  when one closes, the rest animate to fill the gap.
+- **Subagent‑aware** — subagent lifecycle notifications (a session spawning
+  subagents) don't each raise a panel; only events you act on do. Tunable via
+  `notifications.suppressTypes`.
+- **Stacks any number** — panels tile from the corner and wrap into columns;
+  when more than a few pile up unattended they collapse into one macOS‑style
+  stack you click to fan open (and it re‑collapses when idle again).
 - **Fully themeable** — position, size, transparency, material, colors, fonts,
   animation, sound, and per‑type timeouts, all in one JSON file.
 
@@ -88,6 +92,31 @@ apply to the **next** notification, no rebuild needed.
 ```jsonc
 {
   "timeouts": { "done": 30, "attention": 0 }, // auto-dismiss seconds; 0 = never
+
+  // Notification-event handling.
+  "notifications": {
+    // Notification .notification_type values that never raise a panel. Subagent
+    // lifecycle (e.g. a subagent finishing) fires one per action and floods
+    // otherwise; real prompts (permission_prompt, idle_prompt, ...) still show.
+    "suppressTypes": ["agent_completed"],
+    // Flip to true to append every raw hook payload to
+    // state/debug-payloads.log, so you can read the exact notification_type
+    // values your setup emits and tune suppressTypes. Turn back off when done.
+    "debugLog": false,
+  },
+
+  // When more than `threshold` panels are alive and none has been acted on for
+  // `delaySeconds`, they collapse into one macOS-style stack you click to fan
+  // open (re-collapsing after another idle period). A brand-new panel peeks on
+  // its own for `peekSeconds` before joining.
+  "stacking": {
+    "enabled": true,
+    "threshold": 3,
+    "delaySeconds": 20,
+    "peekSeconds": 2.0,
+    "cascadeOffset": 8, // px each stacked card peeks behind the front one
+  },
+
   "sound": "Glass", // macOS system sound; "" = silent
   "position": "bottom-left", // bottom-left | bottom-right | top-left | top-right
   "size": { "width": 420, "height": 120 },
@@ -156,7 +185,7 @@ Precision depends on what each terminal app exposes:
 | **VS Code**         | ✅ via companion extension | ✅ via companion extension |
 | **Terminal.app**    | ✅ (AppleScript, by tty)   | ✅ (AppleScript, by tty)   |
 | **iTerm2**          | ✅ (AppleScript, by tty)   | ✅ (AppleScript, by tty)   |
-| **WezTerm**         | ✅ (`wezterm cli`)         | ➖ click to dismiss        |
+| **WezTerm**         | ✅ (`wezterm cli`)         | ✅ (`wezterm cli`, by tty) |
 | **Warp**            | ✅ (`WARP_FOCUS_URL`)      | ➖ click to dismiss¹       |
 | **Ghostty / other** | ➖ app foreground          | ➖ click to dismiss        |
 
